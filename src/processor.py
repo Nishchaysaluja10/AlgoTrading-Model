@@ -36,7 +36,8 @@ class DataProcessor:
         if self.volume_col in df.columns:
             df['vol_sma_10'] = df[self.volume_col].rolling(window=10).mean()
             df['rvol_10'] = df[self.volume_col] / (df['vol_sma_10'] + 1e-8)
-
+        df['return_1m'] = df[self.target_col].pct_change()
+        df['return_5m'] = df[self.target_col].pct_change(periods=5)
         df['target_up'] = (df[self.target_col].shift(-1) > df[self.target_col]).astype(int)
         
         # --- SANITIZATION (The Fix) ---
