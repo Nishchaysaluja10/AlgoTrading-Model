@@ -1,0 +1,28 @@
+# Byte-Hackathon .gitignore
+
+# 1. Python Environment
+venv/
+env/
+__pycache__/
+*.py[cod]
+*$py.class
+
+# 2. Local Data (Never push massive CSVs)
+data/*.csv
+data/*.json
+
+# 3. Model Files (Keep your repo light)
+models/*.pkl
+models/*.joblib
+catboost_info/
+
+# 4. Logs and Reports
+logs/*.log
+*.png
+catboost_training.json
+
+# 5. OS Specific
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
