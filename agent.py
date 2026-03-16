@@ -62,6 +62,9 @@ def buy(qty: int):
     if qty <= 0:
         return None
     r = requests.post(f"{API_URL}/api/buy", json={"quantity": qty}, headers=HEADERS, timeout=5)
+    if r.status_code == 400:
+        print(f"  ⚠️  BUY rejected by server (400): {r.text[:120]} — skipping")
+        return None
     r.raise_for_status()
     return r.json()
 
@@ -69,6 +72,9 @@ def sell(qty: int):
     if qty <= 0:
         return None
     r = requests.post(f"{API_URL}/api/sell", json={"quantity": qty}, headers=HEADERS, timeout=5)
+    if r.status_code == 400:
+        print(f"  ⚠️  SELL rejected by server (400): {r.text[:120]} — skipping")
+        return None
     r.raise_for_status()
     return r.json()
 
@@ -197,7 +203,7 @@ class SignalEngine:
         if n < 10:
             return 'warmup', 0
 
-        # ── Indicators ───────────────────────────────────────────────
+        # ── Core indicators ───────────────────────────────────────────
         mean10 = p[-10:].mean(); std10 = p[-10:].std() + 1e-8
         z10    = (p[-1] - mean10) / std10
 
@@ -209,24 +215,43 @@ class SignalEngine:
         momentum = (p[-1] - p[-4]) / p[-4] if n >= 4 else 0.0
         prob     = self._ml_signal(hist_closes, hist_volumes)
 
-        # ── HARD ENTRY GATE ───────────────────────────────────────────
-        # Only buy when BOTH z10 AND z30 are negative.
-        # This means price must be below BOTH its short and long mean —
-        # a genuine dip, not just a short-term fluctuation.
-        # This is the fix for buying at 100.17 after selling at 100.15.
-        ok_to_buy  = (z10 < -0.3) and (z30 < 0.3)
+        # ── REGIME DETECTION ─────────────────────────────────────────
+        # Measure how consistently price has moved in one direction.
+        # Count how many of the last 5 closes were higher than previous.
+        # 4-5 up-closes = uptrend, 0-1 up-closes = downtrend, else choppy.
+        up_count = sum(1 for i in range(-5, -1) if p[i+1] > p[i]) if n >= 6 else 2
+        if up_count >= 4:
+            regime = 'uptrend'
+        elif up_count <= 1:
+            regime = 'downtrend'
+        else:
+            regime = 'choppy'
 
-        # Only sell when price is above the short-term mean
-        ok_to_sell = (z10 > 0.3)
+        # ── STRATEGY SELECTION ────────────────────────────────────────
+        # Choppy/ranging market → mean reversion (buy dips, sell rips)
+        # Trending market       → momentum (buy breakouts, hold longer)
 
-        # ── ALSO: don't re-enter if price is higher than last exit ────
-        # Track last_exit_price in portfolio dict (we store it externally)
         last_exit = portfolio.get('last_exit_price', 0)
+
+        if regime == 'uptrend' and not holding:
+            # TREND MODE: buy any pullback in an uptrend
+            if z10 < 0.0 and momentum >= -0.0005:
+                qty = max(0, int(cash_avail * POS_PCT / price))
+                if qty > 0 and (last_exit == 0 or price < last_exit * 1.002):
+                    return 'buy', qty
+
+        elif regime == 'downtrend' and holding:
+            # TREND MODE: exit immediately in a downtrend
+            if z10 > -0.5:
+                return 'sell', portfolio['shares']
+
+        # ── MEAN REVERSION MODE (choppy market) ───────────────────────
+        ok_to_buy  = (z10 < -0.8) and (z30 < 0.4)   # raised: need bigger dip
+        ok_to_sell = (z10 > 0.8)                         # raised: need bigger peak
+
         if last_exit > 0 and price >= last_exit * 1.001:
-            # Price is 0.1% above where we just sold — don't chase it
             ok_to_buy = False
 
-        # ── Score ─────────────────────────────────────────────────────
         buy_score  = 0
         sell_score = 0
 
@@ -240,7 +265,6 @@ class SignalEngine:
         if z30 < -0.5:   buy_score  += 1
         if z30 > 0.5:    sell_score += 1
 
-        # Momentum only votes when aligned with z10 direction
         if momentum > 0.0001 and z10 < 0:  buy_score  += 1
         if momentum < -0.0001 and z10 > 0: sell_score += 1
 
@@ -248,24 +272,22 @@ class SignalEngine:
             if   prob >= 0.56: buy_score  += 2
             elif prob <= 0.44: sell_score += 2
 
-        # ── EXTREME z10: act immediately ─────────────────────────────
+        # Extreme z10 overrides
         if z10 >= 2.0 and holding and ok_to_sell:
             return 'sell', portfolio['shares']
 
-        if z10 <= -2.0 and momentum >= 0 and ok_to_buy:
+        if z10 <= -2.0 and momentum >= 0 and ok_to_buy and not holding:
             qty = max(0, int(cash_avail * POS_PCT / price))
             if qty > 0: return 'buy', qty
 
-        # ── NORMAL SIGNALS ────────────────────────────────────────────
-        if buy_score >= 3 and ok_to_buy:
+        # No pyramiding — only buy when flat (avoids double fee on same position)
+        if buy_score >= 3 and ok_to_buy and not holding:
             qty = max(0, int(cash_avail * POS_PCT / price))
             if qty > 0: return 'buy', qty
 
-        if sell_score >= 3 and ok_to_sell and holding:
-            if z10 > 1.5 or sell_score >= 5:
-                return 'sell', portfolio['shares']          # full exit
-            else:
-                return 'sell', max(1, portfolio['shares'] // 2)  # half exit
+        # Raised to 4 and always full exit — one fee not two
+        if sell_score >= 4 and ok_to_sell and holding:
+            return 'sell', portfolio['shares']
 
         return 'hold', 0
 
@@ -379,7 +401,9 @@ def run():
                     std30  = np.std(hist_closes[-30:]) + 1e-8
                     z30    = (price - mean30) / std30
                 z_bar  = '▼' if z10 < -1 else ('▲' if z10 > 1 else '─')
-                status = f"z10={z10:+.2f}{z_bar} z30={z30:+.2f} | {action.upper()}"
+                up_c = sum(1 for i in range(-5,-1) if hist_closes[i+1] > hist_closes[i]) if len(hist_closes)>=6 else 2
+                regime_icon = '📈' if up_c >= 4 else ('📉' if up_c <= 1 else '〰')
+                status = f"z10={z10:+.2f}{z_bar} z30={z30:+.2f} {regime_icon} | {action.upper()}"
             else:
                 status = f"⏳ warming up {n}/10"
 
