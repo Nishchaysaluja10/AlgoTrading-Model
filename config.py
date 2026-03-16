@@ -19,8 +19,8 @@ STOP_LOSS_PCT = 0.02
 TAKE_PROFIT_PCT = 0.05
 
 # === SIGNAL THRESHOLDS ===
-BUY_THRESHOLD = 0.65        # Probability above this → BUY signal
-SELL_THRESHOLD = 0.35        # Probability below this → SELL signal
+BUY_THRESHOLD = 0.50        # Probability above this → BUY signal
+SELL_THRESHOLD = 0.50        # Probability below this → SELL signal
 
 # === LIVE LEARNING ===
 RETRAIN_INTERVAL = 50        # Retrain model every N live samples

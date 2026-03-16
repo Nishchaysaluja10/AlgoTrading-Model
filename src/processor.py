@@ -130,7 +130,20 @@ class DataProcessor:
         # TARGET & CLEANUP
         # ================================================================
         if training:
-            df['target_up'] = (df[close].shift(-1) > df[close]).astype(int)
+            # --- NEW HORIZON TARGET ---
+            # Predict if the price will go up by at least 0.25% (to cover 0.2% fees + profit)
+            # within the next 15 ticks (~2.5 minutes)
+            horizon = 15
+            profit_threshold = 0.0025  # 0.25%
+
+            # Get the maximum price in the next 15 ticks
+            future_max = df[close].rolling(window=horizon, min_periods=1).max().shift(-horizon)
+            
+            # Target is 1 if future max > current price * (1 + profit_threshold)
+            df['target_up'] = (future_max > (df[close] * (1 + profit_threshold))).astype(int)
+            
+            # Drop the last 'horizon' rows because we can't see their future
+            df = df.iloc[:-horizon]
             df = df.dropna().reset_index(drop=True)
         else:
             # For inference, drop rows where ANY numeric feature is NaN

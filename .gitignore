@@ -2,7 +2,7 @@
 
 # 1. Python Environment
 venv/
-env/
+.env/
 __pycache__/
 *.py[cod]
 *$py.class
@@ -10,6 +10,8 @@ __pycache__/
 # 2. Local Data (Never push massive CSVs)
 data/*.csv
 data/*.json
+data/*.pdf
+data/*.ipynb
 
 # 3. Model Files (Keep your repo light)
 models/*.pkl

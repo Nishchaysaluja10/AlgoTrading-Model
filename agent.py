@@ -19,8 +19,11 @@ API_KEY = os.getenv("TEAM_API_KEY", "YOUR_KEY_HERE")
 HEADERS = {"X-API-Key": API_KEY}
 
 # ── Thresholds (tuned for cash decay vs fee tradeoff) ──
-BUY_PROB      = 0.55     # ML probability above this → BUY candidate
-SELL_PROB     = 0.45     # ML probability below this → SELL candidate
+# prob > BUY_PROB  → model says price will go UP   → BUY
+# prob < SELL_PROB → model says price will go DOWN → SELL
+# prob in between  → uncertain                     → HOLD
+BUY_PROB      = 0.40     # ✨ SUPER AGGRESSIVE ✨ (was 0.50)
+SELL_PROB     = 0.40     # ✨ SUPER AGGRESSIVE ✨ (was 0.40)
 POS_PCT       = 0.50     # Fraction of net worth to deploy
 MAX_POS_PCT   = 0.60     # Server-enforced max position
 STOP_LOSS     = 0.02     # Fixed stop-loss fallback (2%)
@@ -28,10 +31,10 @@ TP_TIER1_PCT  = 0.015    # Take-profit tier 1 (1.5%)
 TP_TIER2_TRAIL= 0.005    # Trailing stop for tier 2 (0.5%)
 BREAKEVEN_PCT = 0.010    # Move SL to breakeven at 1.0% profit
 FEE_PCT       = 0.001    # 0.1% transaction fee
-COOLDOWN_TICKS= 9        # ~90 seconds cooldown after trade
+COOLDOWN_TICKS= 3        # ~30 seconds cooldown after trade
 DRAWDOWN_KILL = 0.03     # Kill switch at 3% drawdown
-RSI_BUY_MAX   = 60       # Don't buy if RSI > 60
-RR_MIN        = 1.5      # Minimum risk/reward ratio
+RSI_BUY_MAX   = 65       # Don't buy if RSI > 65 (was 60, slightly relaxed)
+RR_MIN        = 1.2      # Minimum risk/reward ratio (was 1.5, relaxed to trigger more buys)
 ATR_SPIKE_MULT= 3.0      # Sit out if candle > 3x ATR
 
 MODEL_PATH    = "models/xgb_model.pkl"
@@ -46,6 +49,12 @@ def get_price():
 
 def get_portfolio():
     r = requests.get(f"{API_URL}/api/portfolio", headers=HEADERS, timeout=5)
+    r.raise_for_status()
+    return r.json()
+
+def get_history():
+    """Fetch recent historical ticks to pre-fill the buffer and avoid the 30-tick wait."""
+    r = requests.get(f"{API_URL}/api/history", headers=HEADERS, timeout=5)
     r.raise_for_status()
     return r.json()
 
@@ -257,7 +266,7 @@ def pre_flight_check(closes, highs, lows, volumes, tick_count, total_ticks, has_
     regime = 'trend' if adx > 25 else 'reversion'
 
     # ── Trend Alignment: Price > 20-EMA for buys ──
-    ema_20 = pd.Series(closes).ewm(span=20, adjust=False).iloc[-1]
+    ema_20 = pd.Series(closes).ewm(span=20, adjust=False).mean().iloc[-1]
     trend_ok = closes[-1] >= ema_20  # Will be checked specifically for BUY signals
 
     # ── RVOL Check ──
@@ -329,7 +338,7 @@ def entry_confluence(action, closes, rsi, atr, price, has_ohlc, candle_range=0):
 
     # ── Trend Alignment ──
     if len(closes) >= 20:
-        ema_20 = pd.Series(closes).ewm(span=20, adjust=False).iloc[-1]
+        ema_20 = pd.Series(closes).ewm(span=20, adjust=False).mean().iloc[-1]
         if price < ema_20:
             return False, f'Price below 20-EMA ({price:.4f} < {ema_20:.4f})'
 
@@ -352,8 +361,8 @@ class PositionManager:
         self.peak_price = price
         self.tp1_hit = False
         self.original_shares = shares
-        # ATR-based stop loss (1.5x ATR below entry)
-        self.sl_price = price - (1.5 * atr) if atr > 0 else price * (1 - STOP_LOSS)
+        # ATR-based stop loss: increased from 1.5x to 5.0x to avoid microscopic 10-second noise
+        self.sl_price = price - (5.0 * atr) if atr > 0 else price * (1 - STOP_LOSS)
 
     def check(self, price, shares):
         """
@@ -513,7 +522,12 @@ def decide(ohlcv_buffer, portfolio, price, model, feature_names, pos_mgr, sys_gu
     elif action == 'sell':
         if shares <= 0:
             return 'hold', 0, '[L2-ML] Sell signal but no shares'
-        return 'sell', shares, f'[L2-ML] SELL (prob={prob:.3f}, shares={shares})'
+        else:
+            # ✨ AGGRESSIVE MODE ✨
+            # We bought aggressively, so we must HOLD aggressively. 
+            # We ignore the ML model's raw sell signals while in a position,
+            # trusting our 5.0x ATR Stop-Loss and Take-Profit tiers to handle the exit.
+            return 'hold', 0, f'[L2-ML] Ignoring ML Sell (prob={prob:.3f}) to let position run'
 
     return 'hold', 0, f'[L2-ML] Hold (prob={prob:.3f})'
 
@@ -543,7 +557,21 @@ if __name__ == "__main__":
     has_vol = None
     total_ticks = 1080  # 3 hours × 6 ticks/min (estimate, will update from API)
 
-    print("🟢 Bot is LIVE. Ctrl+C to stop.\n")
+    # ── Pre-fill Buffer using History API ──
+    print("\n⏳ Pre-filling buffer from /api/history to skip the 5-minute wait...")
+    try:
+        hist_data = get_history()
+        if isinstance(hist_data, list):
+            for t in hist_data[-100:]:  # Take last 100 max
+                t_norm = {k.lower(): v for k, v in t.items()}
+                ohlcv_buffer.append(t_norm)
+            print(f"✅ Loaded {len(ohlcv_buffer)} historical ticks. Ready to trade instantly!")
+        else:
+            print("⚠️ /api/history did not return a list. Falling back to live buffering.")
+    except Exception as e:
+        print(f"⚠️ Could not fetch history ({e}). Will buffer live data.")
+
+    print("\n🟢 Bot is LIVE. Ctrl+C to stop.\n")
 
     while True:
         try:
@@ -597,11 +625,10 @@ if __name__ == "__main__":
                 print(f"  🔻 SELL {qty} @ {price:.4f} | {reason}")
 
             else:
-                # ── Heartbeat every 3 ticks ──
-                if tick_num % 3 == 0:
-                    sharpe = sys_guard.get_sharpe()
-                    print(f"  💓 tick={tick_num} | {price:.4f} | nw=${port.get('net_worth',0):,.0f} | "
-                          f"pnl={port.get('pnl_pct',0):+.2f}% | sharpe={sharpe:.2f} | {reason}")
+                # ── Heartbeat every tick ──
+                sharpe = sys_guard.get_sharpe()
+                print(f"  💓 tick={tick_num} | {price:.4f} | nw=${port.get('net_worth',0):,.0f} | "
+                      f"pnl={port.get('pnl_pct',0):+.2f}% | sharpe={sharpe:.2f} | {reason}")
 
             tick_num += 1
             time.sleep(10)
