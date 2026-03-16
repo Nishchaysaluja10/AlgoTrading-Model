@@ -2,7 +2,7 @@ import requests
 
 class APIHandler:
     def __init__(self, base_url, api_key):
-        self.base_url = base_url
+        self.base_url = base_url.rstrip('/')
         self.headers = {
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json"
