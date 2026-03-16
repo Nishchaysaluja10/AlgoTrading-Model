@@ -17,7 +17,7 @@ matplotlib==3.10.8
 multitasking==0.0.12
 narwhals==2.18.0
 numpy==2.4.3
-nvidia-nccl-cu12==2.29.7
+# nvidia-nccl-cu12==2.29.7  # NCCL is not supported on Windows
 packaging==26.0
 pandas==3.0.1
 peewee==4.0.1
