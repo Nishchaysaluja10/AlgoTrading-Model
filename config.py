@@ -1,13 +1,13 @@
 """
-Config — AlgoTrading Bot
-Update these values before connecting to your actual trading server.
+Config — AlgoTrading Bot (Hackathon Final)
 """
 
 # === SERVER CONNECTION ===
 API_BASE_URL = "http://YOUR_SERVER_IP:PORT/api"   # ← Replace with real server URL
 API_KEY = "YOUR_API_KEY"                           # ← Replace with real API key
 
-# === MODEL ===
+# === DATA ===
+DATA_PATH = "data/asset_alpha_training.csv"
 TARGET_COL = "close" 
 MODEL_SAVE_PATH = "models/xgb_model.pkl"
 

@@ -1,17 +1,22 @@
+"""
+Analyze — Visualize feature importances from the trained ensemble model.
+Usage: python analyze.py
+"""
 import joblib
 import pandas as pd
 import matplotlib.pyplot as plt
 import os
+import config
 from src.processor import DataProcessor
 
-def analyze_features(model_path="models/xgb_model.pkl", data_path="data/historical_data.csv"):
-    if not os.path.exists(model_path):
-        print("❌ No trained model found.")
+def analyze_features():
+    if not os.path.exists(config.MODEL_SAVE_PATH):
+        print("❌ No trained model found. Run train.py first.")
         return
 
-    # 1. Load and Process data to get the EXACT feature names used in training
-    df_raw = pd.read_csv(data_path)
-    processor = DataProcessor()
+    # 1. Load and process data to get the EXACT feature names used in training
+    df_raw = pd.read_csv(config.DATA_PATH)
+    processor = DataProcessor(target_col=config.TARGET_COL, volume_col='volume')
     df_processed = processor.engineer_features(df_raw)
     
     # Remove the target column to match the training features
@@ -19,20 +24,19 @@ def analyze_features(model_path="models/xgb_model.pkl", data_path="data/historic
     feature_names = X.columns.tolist()
 
     # 2. Load the model and extract averaged importance
-    loaded_data = joblib.load(model_path)
+    loaded_data = joblib.load(config.MODEL_SAVE_PATH)
     if isinstance(loaded_data, dict):
         ensemble = loaded_data['model']
-        feature_names = loaded_data.get('feature_names', X.columns.tolist())
+        feature_names = loaded_data.get('feature_names', feature_names)
     else:
         ensemble = loaded_data
-        feature_names = X.columns.tolist()
     
     # Extract importances from all models in the ensemble
     xgb_imp = ensemble.named_estimators_['xgb'].feature_importances_
     cat_imp = ensemble.named_estimators_['cat'].get_feature_importance()
     lgb_imp = ensemble.named_estimators_['lgb'].feature_importances_
     
-    # Average them (Normalization might be needed, but simple average is often okay for ranking)
+    # Average them
     importances = (xgb_imp + cat_imp + lgb_imp) / 3
 
     # 3. Match and Plot
