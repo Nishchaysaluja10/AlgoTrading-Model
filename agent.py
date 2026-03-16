@@ -189,74 +189,83 @@ class SignalEngine:
         return prob
 
     def decide(self, hist_closes, hist_volumes, portfolio, price):
-        """
-        Mean-reversion strategy — buys dips, sells rips.
-        Works well in choppy/range-bound markets.
-        Falls back to ML when we have enough data.
-        """
-        p   = np.array(hist_closes, dtype=float)
-        n   = len(p)
+        p          = np.array(hist_closes, dtype=float)
+        n          = len(p)
+        holding    = portfolio['shares'] > 0
+        cash_avail = portfolio['cash']
 
-        # ── Need at least 10 ticks for any signal ────────────────────
         if n < 10:
-            print(f"  [warmup] {n}/10 ticks collected — waiting to trade")
-            return 'hold', 0
+            return 'warmup', 0
 
-        # ── Core indicators (all work with just 10+ ticks) ───────────
-
-        # 1. Short z-score (10-period) — catches quick mean reversions
-        mean10 = p[-10:].mean()
-        std10  = p[-10:].std() + 1e-8
+        # ── Indicators ───────────────────────────────────────────────
+        mean10 = p[-10:].mean(); std10 = p[-10:].std() + 1e-8
         z10    = (p[-1] - mean10) / std10
 
-        # 2. Longer z-score (30-period) if we have enough data
         z30 = 0.0
         if n >= 30:
-            mean30 = p[-30:].mean()
-            std30  = p[-30:].std() + 1e-8
+            mean30 = p[-30:].mean(); std30 = p[-30:].std() + 1e-8
             z30    = (p[-1] - mean30) / std30
 
-        # 3. Short-term momentum (last 3 ticks)
         momentum = (p[-1] - p[-4]) / p[-4] if n >= 4 else 0.0
-
-        # 4. ML probability (only when we have 35+ ticks)
         prob     = self._ml_signal(hist_closes, hist_volumes)
-        prob_str = f'{prob:.3f}' if prob is not None else 'n/a'
 
-        # ── Signal logic ──────────────────────────────────────────────
-        # BUY when: price is below mean (z < -1.0) AND momentum starting to recover
-        # SELL when: price is above mean (z > 1.0) AND momentum fading
-        # ML confirms or overrides when available
+        # ── HARD ENTRY GATE ───────────────────────────────────────────
+        # Only buy when BOTH z10 AND z30 are negative.
+        # This means price must be below BOTH its short and long mean —
+        # a genuine dip, not just a short-term fluctuation.
+        # This is the fix for buying at 100.17 after selling at 100.15.
+        ok_to_buy  = (z10 < -0.3) and (z30 < 0.3)
 
+        # Only sell when price is above the short-term mean
+        ok_to_sell = (z10 > 0.3)
+
+        # ── ALSO: don't re-enter if price is higher than last exit ────
+        # Track last_exit_price in portfolio dict (we store it externally)
+        last_exit = portfolio.get('last_exit_price', 0)
+        if last_exit > 0 and price >= last_exit * 1.001:
+            # Price is 0.1% above where we just sold — don't chase it
+            ok_to_buy = False
+
+        # ── Score ─────────────────────────────────────────────────────
         buy_score  = 0
         sell_score = 0
 
-        # Z-score signals (main driver)
-        if z10 < -1.2:   buy_score  += 2
-        elif z10 < -0.8: buy_score  += 1
-        if z10 > 1.2:    sell_score += 2
-        elif z10 > 0.8:  sell_score += 1
+        if   z10 < -1.5: buy_score  += 3
+        elif z10 < -1.0: buy_score  += 2
+        elif z10 < -0.5: buy_score  += 1
+        if   z10 > 1.5:  sell_score += 3
+        elif z10 > 1.0:  sell_score += 2
+        elif z10 > 0.5:  sell_score += 1
 
-        if z30 < -1.0:   buy_score  += 1
-        if z30 > 1.0:    sell_score += 1
+        if z30 < -0.5:   buy_score  += 1
+        if z30 > 0.5:    sell_score += 1
 
-        # Momentum confirmation — don't buy into a falling knife
-        if momentum > 0:  buy_score  += 1  # price recovering → confirms buy
-        if momentum < 0:  sell_score += 1  # price falling    → confirms sell
+        # Momentum only votes when aligned with z10 direction
+        if momentum > 0.0001 and z10 < 0:  buy_score  += 1
+        if momentum < -0.0001 and z10 > 0: sell_score += 1
 
-        # ML overlay
         if prob is not None:
-            if prob >= 0.53:  buy_score  += 2
-            elif prob <= 0.47: sell_score += 2
+            if   prob >= 0.56: buy_score  += 2
+            elif prob <= 0.44: sell_score += 2
 
-        print(f"  [tick={n}] z10={z10:+.2f} z30={z30:+.2f} mom={momentum*100:+.3f}% prob={prob_str} | buy={buy_score} sell={sell_score}")
-
-        # Need score >= 3 to act (prevents noise trades)
-        if buy_score >= 3 and buy_score > sell_score:
-            qty = max(0, int(portfolio['cash'] * POS_PCT / price))
-            return 'buy', qty
-        elif sell_score >= 3 and sell_score > buy_score:
+        # ── EXTREME z10: act immediately ─────────────────────────────
+        if z10 >= 2.0 and holding and ok_to_sell:
             return 'sell', portfolio['shares']
+
+        if z10 <= -2.0 and momentum >= 0 and ok_to_buy:
+            qty = max(0, int(cash_avail * POS_PCT / price))
+            if qty > 0: return 'buy', qty
+
+        # ── NORMAL SIGNALS ────────────────────────────────────────────
+        if buy_score >= 3 and ok_to_buy:
+            qty = max(0, int(cash_avail * POS_PCT / price))
+            if qty > 0: return 'buy', qty
+
+        if sell_score >= 3 and ok_to_sell and holding:
+            if z10 > 1.5 or sell_score >= 5:
+                return 'sell', portfolio['shares']          # full exit
+            else:
+                return 'sell', max(1, portfolio['shares'] // 2)  # half exit
 
         return 'hold', 0
 
@@ -269,15 +278,10 @@ def run():
 
     # Connection test
     try:
-        import requests as _req
-        _raw_price = _req.get(f"{API_URL}/api/price", headers=HEADERS, timeout=5).json()
-        _raw_port  = _req.get(f"{API_URL}/api/portfolio", headers=HEADERS, timeout=5).json()
-        print(f"🔍 Raw price response : {_raw_price}")
-        print(f"🔍 Raw portfolio response: {_raw_port}")
         tick = get_price()
         port = get_portfolio()
-        print(f"✅ Connected | price={tick['close']:.4f} | phase={tick.get('phase')} | tick={tick.get('tick_number')}")
-        print(f"   cash=${port['cash']:,.0f} | shares={port['shares']} | nw=${port['net_worth']:,.0f} | pnl={port['pnl_pct']:+.2f}%")
+        print(f"✅ Connected | price={tick['close']:.4f} | phase={tick['phase']} | tick={tick['tick_number']}")
+        print(f"   cash=${port['cash']:,.2f} | shares={port['shares']} | nw=${port['net_worth']:,.2f} | pnl={port['pnl_pct']:+.2f}%")
     except Exception as e:
         print(f"❌ Connection failed: {e}")
         return
@@ -285,8 +289,9 @@ def run():
     engine       = SignalEngine()
     hist_closes  = []
     hist_volumes = []
-    entry_price  = None
-    peak_price   = None
+    entry_price      = None
+    peak_price       = None
+    last_exit_price  = 0      # prevents re-entering above last sell price
 
     # ── No pre-fill needed — strategy works from tick 10 onwards ──────
     # Training CSV is at price ~132, live market is ~100 — seeding from
@@ -317,6 +322,15 @@ def run():
             # ── Extract tick number for logging ──────────────────────
             tick_num = tick['tick_number']
 
+            # ── Reset last_exit_price gate after 20 ticks (~3 min) ───
+            # Prevents the bot getting permanently locked out if it sold
+            # at a local low and price never drops back below that level.
+            if not hasattr(run, '_last_exit_tick'):
+                run._last_exit_tick = 0
+            if last_exit_price > 0 and (tick_num - run._last_exit_tick) > 20:
+                last_exit_price = 0
+                run._last_exit_tick = tick_num
+
             # ── Risk management (checked before new signals) ──────────
             if port['shares'] > 0 and entry_price is not None:
                 # Update trailing peak
@@ -327,54 +341,88 @@ def run():
 
                 if pnl_pct < -STOP_LOSS:
                     sell(port['shares'])
-                    print(f"🛑 STOP-LOSS  @ {price:.4f} | pnl={pnl_pct*100:+.2f}%")
+                    port = get_portfolio()
+                    last_exit_price = price
+                    print(f"  🛑 STOP-LOSS   @ {price:.4f} | pnl={pnl_pct*100:+.2f}% | nw=${port['net_worth']:,.2f}")
                     entry_price = None; peak_price = None
                     time.sleep(TICK_SLEEP); continue
 
                 elif pnl_pct >= TAKE_PROFIT:
                     sell(port['shares'])
-                    print(f"✅ TAKE-PROFIT @ {price:.4f} | pnl={pnl_pct*100:+.2f}%")
+                    port = get_portfolio()
+                    last_exit_price = price
+                    print(f"  🎯 TAKE-PROFIT @ {price:.4f} | pnl={pnl_pct*100:+.2f}% | nw=${port['net_worth']:,.2f}")
                     entry_price = None; peak_price = None
                     time.sleep(TICK_SLEEP); continue
 
                 elif price < peak_price * (1 - TRAIL_PCT):
                     sell(port['shares'])
-                    print(f"📉 TRAIL-STOP  @ {price:.4f} | peak={peak_price:.4f} | pnl={pnl_pct*100:+.2f}%")
+                    port = get_portfolio()
+                    last_exit_price = price
+                    print(f"  📉 TRAIL-STOP  @ {price:.4f} | peak={peak_price:.4f} | pnl={pnl_pct*100:+.2f}% | nw=${port['net_worth']:,.2f}")
                     entry_price = None; peak_price = None
                     time.sleep(TICK_SLEEP); continue
 
             # ── Signal ────────────────────────────────────────────────
+            port['last_exit_price'] = last_exit_price
             action, qty = engine.decide(hist_closes, hist_volumes, port, price)
 
-            if action == 'buy' and qty > 0 and port['shares'] == 0:
+            # ── Indicator summary (shown every tick, compact) ─────────
+            n = len(hist_closes)
+            if n >= 10:
+                mean10 = np.mean(hist_closes[-10:])
+                std10  = np.std(hist_closes[-10:]) + 1e-8
+                z10    = (price - mean10) / std10
+                z30    = 0.0
+                if n >= 30:
+                    mean30 = np.mean(hist_closes[-30:])
+                    std30  = np.std(hist_closes[-30:]) + 1e-8
+                    z30    = (price - mean30) / std30
+                z_bar  = '▼' if z10 < -1 else ('▲' if z10 > 1 else '─')
+                status = f"z10={z10:+.2f}{z_bar} z30={z30:+.2f} | {action.upper()}"
+            else:
+                status = f"⏳ warming up {n}/10"
+
+            pos_label = f"{port['shares']}sh" if port['shares'] > 0 else "flat"
+            print(f"  #{tick_num} {price:.4f} | {status} | {pos_label} | pnl={port['pnl_pct']:+.2f}%")
+
+            # ── Execute ───────────────────────────────────────────────
+            if action == 'buy' and qty > 0:
                 resp = buy(qty)
                 if resp:
                     entry_price = price
                     peak_price  = price
-                    print(f"📈 BUY  {qty:4d} @ {price:.4f} | tick={tick_num} | cash=${port['cash']:,.0f} | nw=${port['net_worth']:,.0f}")
+                    port = get_portfolio()
+                    print(f"  {'─'*55}")
+                    print(f"  📈 BUY  {qty} shares @ {price:.4f} | nw=${port['net_worth']:,.2f}")
+                    print(f"  {'─'*55}")
 
             elif action == 'sell' and port['shares'] > 0:
-                resp = sell(port['shares'])
+                shares_to_sell = qty if qty > 0 else port['shares']
+                resp = sell(shares_to_sell)
                 if resp:
-                    pnl = (price - entry_price) / entry_price * 100 if entry_price else 0
-                    print(f"📉 SELL {port['shares']:4d} @ {price:.4f} | tick={tick_num} | pnl={pnl:+.2f}% | nw=${port['net_worth']:,.0f}")
-                    entry_price = None; peak_price = None
-
-            else:
-                print(f"⏸  HOLD | tick={tick['tick_number']} | price={price:.4f} | shares={port['shares']} | pnl={port['pnl_pct']:+.2f}%")
+                    trade_pnl = (price - entry_price) / entry_price * 100 if entry_price else 0
+                    port = get_portfolio()
+                    icon = "✅" if trade_pnl >= 0 else "🔴"
+                    partial = "(partial)" if port['shares'] > 0 else ""
+                    print(f"  {'─'*55}")
+                    print(f"  {icon} SELL {shares_to_sell} shares @ {price:.4f} {partial} | trade={trade_pnl:+.2f}% | nw=${port['net_worth']:,.2f}")
+                    print(f"  {'─'*55}")
+                    last_exit_price = price       # always update on any sell
+                    if port['shares'] == 0:
+                        entry_price = None
+                        peak_price  = None
 
             time.sleep(TICK_SLEEP)
 
         except KeyboardInterrupt:
             print("\n🛑 Stopped by user.")
             port = get_portfolio()
-            print(f"   Final net worth: ${port['net_worth']:,.0f} | P&L: {port['pnl_pct']:+.2f}%")
+            print(f"   Final net worth: ${port['net_worth']:,.2f} | P&L: {port['pnl_pct']:+.2f}%")
             break
-        except KeyboardInterrupt:
-            raise
         except Exception as e:
             import traceback
-            print(f"⚠️  Error: {e}")
+            print(f"  ⚠️  Error: {e}")
             traceback.print_exc()
             time.sleep(TICK_SLEEP)
 
