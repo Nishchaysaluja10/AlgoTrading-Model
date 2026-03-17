@@ -1,13 +1,11 @@
 """
 agent.py — Asset Alpha Trading Bot  (Kalman + Online ML Edition)
 
-Fixes applied vs previous version:
-  1. BASE_PCT 0.35 → 0.55, floor 0.15→0.45, cap 0.40→0.58  (deploy ~50% not 27%)
-  2. Sell thresholds tightened: kv<-0.008→-0.020, pred_move<-0.005→-0.010
-     Avg hold time: 3 ticks → 8-10 ticks (fee-covering window)
-  3. Take profit 10% → 2.5%  (10% fires on 4% of entries; 2.5% fires 50%)
-  4. Chasing filter 1.001 → 1.008  (was blocking recovery re-entries)
-  5. Re-entry gate 20 ticks → 4 ticks  (signal window is 3-5 ticks)
+New techniques vs previous version:
+  1. Kalman Filter  — smooths price noise, estimates velocity & next-tick prediction
+  2. Online SGDClassifier — learns from every live tick, adapts to current market
+  3. Volatility-adjusted sizing — bets more when market is calm, less when wild
+  4. Fee-aware minimum threshold — never trades unless expected profit > fee cost
 
 API:
   GET  /api/price      → {close, phase, tick_number, volume}
@@ -31,7 +29,7 @@ MODEL_PATH  = "models/xgb_model.pkl"
 TICK_SLEEP  = 10
 EST_FEE_PCT = 0.0007
 MIN_PROFIT  = EST_FEE_PCT * 2.5
-BASE_PCT    = 0.55      # FIX 1: was 0.35 — deploy more to fight cash decay
+BASE_PCT    = 0.35
 
 # ── API ────────────────────────────────────────────────────────────────
 def _cast(v): return v[0] if isinstance(v, (list, tuple)) else v
@@ -218,8 +216,7 @@ class OnlineModel:
 # ── Position sizing ────────────────────────────────────────────────────
 def position_size(cash, price, vol5, base=BASE_PCT):
     vf  = min(0.0005/(vol5+1e-8), 2.0)
-    # FIX 1: floor 0.15→0.45, cap 0.40→0.58  (median deployment 27%→50%)
-    pct = max(0.45, min(0.58, base*vf))
+    pct = max(0.15, min(0.40, base*vf))
     return max(1, int(cash*pct/price)), pct
 
 # ══════════════════════════════════════════════════════════════════════
@@ -260,42 +257,39 @@ class SignalEngine:
         atr        = np.mean(np.abs(np.diff(p[-15:]))) if n>=15 else (price * 0.001)
         up_count   = sum(1 for i in range(-5,-1) if p[i+1]>p[i]) if n>=6 else 2
         regime     = 'up' if up_count>=2 else ('down' if up_count<=1 else 'choppy')
-
+        
         # 5-tick future prediction
-        kp_5        = kl + kv * 5
+        kp_5       = kl + kv * 5
         pred_move_5 = (kp_5 - price) / price
-
-        ml_bull  = prob is not None and prob >= 0.50
-        ml_bear  = prob is not None and prob <= 0.49
-        last_exit = portfolio.get('last_exit_price', 0)
-        # FIX 4: was 1.001 — was blocking re-entries after any small recovery
-        chasing  = last_exit > 0 and price >= last_exit * 1.008
+        
+        ml_bull    = prob is not None and prob >= 0.50
+        ml_bear    = prob is not None and prob <= 0.49
+        last_exit  = portfolio.get('last_exit_price', 0)
+        chasing    = last_exit > 0 and price >= last_exit * 1.001
 
         action, qty, reason = 'hold', 0, ''
 
         if not holding and not chasing:
             buy_sig = False
-            if regime == 'up' and kv > -0.010 and pred_move_5 > -0.010: # Significantly relaxed kv and entry move
+            # Less defensive: allow buying if predicted 5-tick move is positive or slightly negative
+            if regime == 'up' and kv > -0.005 and pred_move_5 > -0.005:
                 buy_sig = True; reason = f'trend+kv={kv:+.4f}'
-            elif dev < -0.005*vol5*1000 and pred_move_5 > -0.015: # Significantly relaxed deviation dip requirement
+            elif dev < -0.010*vol5*1000 and pred_move_5 > -0.01:
                 if ml_bull or prob is None or (regime == 'choppy'):
                     buy_sig = True; reason = f'reversion dev={dev:+.4f}'
-
-            if buy_sig and pred_move_5 < MIN_PROFIT * 0.2: # Barely any fee threshold check
+            
+            if buy_sig and pred_move_5 < MIN_PROFIT * 0.5:
                 buy_sig = False; reason = 'fee_threshold_5t'
             if buy_sig:
                 qty, _ = position_size(cash, price, vol5)
                 action = 'buy'
 
         elif holding:
-            # FIX 2: tightened all three sell conditions to extend avg hold time
-            # kv < -0.008 was firing on 35% of ticks → avg hold only 3 ticks (30s)
-            # kv < -0.025 fires on ~20% → avg hold 8-10 ticks (fee-covering window)
-            if regime == 'down' and kv < -0.025:
+            if regime == 'down' and kv < -0.01:
                 action='sell'; qty=portfolio['shares']; reason='downtrend'
-            elif kv < -0.020 and pred_move_5 < -0.010:
+            elif kv < -0.008 and pred_move_5 < -0.005:
                 action='sell'; qty=portfolio['shares']; reason=f'kv_reversal={kv:+.4f}'
-            elif ml_bear and pred_move_5 < -0.012:
+            elif ml_bear and pred_move_5 < -0.005:
                 action='sell'; qty=portfolio['shares']; reason=f'ml_bear p={prob:.3f}'
             elif regime=='choppy' and dev > 0.1*vol5*1000:
                 action='sell'; qty=portfolio['shares']; reason='reversion_top'
@@ -310,7 +304,7 @@ class SignalEngine:
 # MAIN LOOP
 # ══════════════════════════════════════════════════════════════════════
 def run():
-    print("🚀 Asset Alpha — Kalman + Online ML Edition (Fixed)")
+    print("🚀 Asset Alpha — Kalman + Online ML Edition")
     print(f"   Server : {API_URL}")
     try:
         tick = get_price(); port = get_portfolio()
@@ -353,33 +347,31 @@ def run():
                 if peak_price is None or price > peak_price:
                     peak_price = price
                 pnl_pct = (price - entry_price) / entry_price
-
+                
                 atr = np.mean(np.abs(np.diff(closes[-15:]))) if len(closes) >= 15 else (price * 0.001)
-
+                
                 if sl_price == 0.0:
-                    # WIDENED to 3.0 ATR as requested
-                    sl_price = entry_price - (3.0 * atr)
-
-                # Breakeven: once up 2 ATR, move SL to entry + fees
+                    sl_price = entry_price - (4.0 * atr) # Wider initial stop 4 ATR down
+                
+                # Breakeven condition: if up 2 ATR, move SL to entry + fees + small profit
                 breakeven_dist = 2.0 * atr
                 if (price - entry_price) >= breakeven_dist:
-                    new_sl = entry_price * (1 + EST_FEE_PCT * 2)
+                    new_sl = entry_price * (1 + EST_FEE_PCT * 4)
                     if new_sl > sl_price:
                         sl_price = new_sl
-
-                # Trailing stop: 3.0 ATR from peak once in profit
+                        
+                # Trailing stop: Trail heavily by 3.5 ATR from peak once in profit
                 if (peak_price - entry_price) >= breakeven_dist:
-                    trail_sl = peak_price - (3.0 * atr)
+                    trail_sl = peak_price - (3.5 * atr)
                     if trail_sl > sl_price:
                         sl_price = trail_sl
-
+                        
                 hit = None
                 if price <= sl_price:
                     hit = ('🛑', 'STOP-LOSS / TRAIL')
-                # Lowered take profit to 1.5% to just grab decent wins instead of waiting for huge ones
-                elif pnl_pct >= 0.020:
-                    hit = ('🎯', 'TAKE-PROFIT +2.0%')
-
+                elif pnl_pct >= 0.10: # 10% hard take profit instead of 5%
+                    hit = ('🎯', 'TAKE-PROFIT')
+                    
                 if hit:
                     sell(port['shares']); port = get_portfolio()
                     last_exit_price = price; last_trade_tick = tick_num
@@ -390,8 +382,7 @@ def run():
                     time.sleep(TICK_SLEEP); continue
 
             # ── Gate reset ────────────────────────────────────────────
-            # FIX 5: 20 ticks → 4 ticks  (signal window is 3-5 ticks; 20 outlasts it)
-            if last_exit_price > 0 and (tick_num - last_trade_tick) > 4:
+            if last_exit_price > 0 and (tick_num - last_trade_tick) > 20:
                 last_exit_price = 0
 
             # ── Signal ────────────────────────────────────────────────
@@ -445,7 +436,7 @@ def run():
             print("  ⏳ API Timeout. Retrying soon...")
             time.sleep(TICK_SLEEP * 2)
         except requests.exceptions.ConnectionError:
-            print("  🔌 Connection Error. Retrying...")
+            print("  🔌 Connection Error. Server might be down or unreachable. Retrying...")
             time.sleep(TICK_SLEEP * 2)
         except Exception as e:
             import traceback
