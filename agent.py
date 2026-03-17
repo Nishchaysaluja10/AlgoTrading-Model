@@ -107,8 +107,7 @@ class KalmanFilter:
 class OnlineModel:
     def __init__(self, pretrained_path=MODEL_PATH):
         self.clf    = SGDClassifier(loss='log_loss', learning_rate='adaptive',
-                                    eta0=0.01, random_state=42,
-                                    class_weight='balanced')
+                                    eta0=0.01, random_state=42)
         self.scaler = StandardScaler()
         self.fitted = False
         self.n_seen = 0
@@ -230,13 +229,17 @@ class SignalEngine:
         self.kf_level = None
         self.kf_vel   = 0.0
         self.kf_pred  = None
+        self.prev_kl  = None
+        self.prev_kv  = 0.0
+        self.prev_kp  = None
 
     def update_kalman(self, price):
+        self.prev_kl, self.prev_kv, self.prev_kp = self.kf_level, self.kf_vel, self.kf_pred
         self.kf_level, self.kf_vel, self.kf_pred = self.kf.update(price)
 
     def learn(self, closes, volumes):
-        if self.kf_level is not None:
-            self.model.learn(closes, volumes, self.kf_level, self.kf_vel, self.kf_pred)
+        if self.prev_kl is not None:
+            self.model.learn(closes, volumes, self.prev_kl, self.prev_kv, self.prev_kp)
 
     def decide(self, closes, volumes, portfolio, price):
         n       = len(closes)
@@ -252,34 +255,34 @@ class SignalEngine:
         p          = np.array(closes, dtype=float)
         vol5       = np.std(np.diff(p[-6:])/p[-6:-1]) if n>=6 else 0.001
         up_count   = sum(1 for i in range(-5,-1) if p[i+1]>p[i]) if n>=6 else 2
-        regime     = 'up' if up_count>=4 else ('down' if up_count<=1 else 'choppy')
+        regime     = 'up' if up_count>=3 else ('down' if up_count<=1 else 'choppy')
         pred_move  = (kp - price) / price
-        ml_bull    = prob is not None and prob >= 0.54
-        ml_bear    = prob is not None and prob <= 0.46
+        ml_bull    = prob is not None and prob >= 0.51
+        ml_bear    = prob is not None and prob <= 0.48
         last_exit  = portfolio.get('last_exit_price', 0)
-        chasing    = last_exit > 0 and price >= last_exit * 1.0008
+        chasing    = last_exit > 0 and price >= last_exit * 1.0015
 
         action, qty, reason = 'hold', 0, ''
 
         if not holding and not chasing:
             buy_sig = False
-            if regime == 'up' and kv > 0 and pred_move > 0:
+            if regime == 'up' and kv > -0.002 and pred_move > -0.0005:
                 buy_sig = True; reason = f'trend+kv={kv:+.4f}'
-            elif regime == 'choppy' and dev < -0.05*vol5*1000 and pred_move > 0:
-                if ml_bull or prob is None:
+            elif dev < -0.02*vol5*1000 and pred_move > -0.002:
+                if ml_bull or prob is None or (regime == 'choppy' and (prob is None or prob > 0.48)):
                     buy_sig = True; reason = f'reversion dev={dev:+.4f}'
-            if buy_sig and abs(pred_move) < MIN_PROFIT * 0.5:
+            if buy_sig and abs(pred_move) < MIN_PROFIT * 0.1:
                 buy_sig = False; reason = 'fee_threshold'
             if buy_sig:
                 qty, _ = position_size(cash, price, vol5)
                 action = 'buy'
 
         elif holding:
-            if regime == 'down':
+            if regime == 'down' and kv < -0.005:
                 action='sell'; qty=portfolio['shares']; reason='downtrend'
-            elif kv < -0.002 and pred_move < 0:
+            elif kv < -0.005 and pred_move < -0.0005:
                 action='sell'; qty=portfolio['shares']; reason=f'kv_reversal={kv:+.4f}'
-            elif ml_bear and pred_move < 0:
+            elif ml_bear and pred_move < -0.001:
                 action='sell'; qty=portfolio['shares']; reason=f'ml_bear p={prob:.3f}'
             elif regime=='choppy' and dev > 0.05*vol5*1000:
                 action='sell'; qty=portfolio['shares']; reason='reversion_top'
@@ -401,8 +404,15 @@ def run():
         except KeyboardInterrupt:
             print("\n🛑 Stopped.")
             port = get_portfolio()
-            print(f"   nw=${port['net_worth']:,.2f} | P&L={port['pnl_pct']:+.2f}%")
+            if port:
+                print(f"   nw=${port.get('net_worth',0):,.2f} | P&L={port.get('pnl_pct',0):+.2f}%")
             break
+        except requests.exceptions.Timeout:
+            print("  ⏳ API Timeout. Retrying soon...")
+            time.sleep(TICK_SLEEP * 2)
+        except requests.exceptions.ConnectionError:
+            print("  🔌 Connection Error. Server might be down or unreachable. Retrying...")
+            time.sleep(TICK_SLEEP * 2)
         except Exception as e:
             import traceback
             print(f"  ⚠️  {e}")
