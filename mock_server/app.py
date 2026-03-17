@@ -18,7 +18,7 @@ except Exception as e:
 # Global state
 class State:
     def __init__(self):
-        self.tick_index = 0
+        self.tick_index = 100
         self.start_cash = 100000.0
         self.cash = 100000.0
         self.shares = 0
@@ -46,6 +46,23 @@ def verify_key():
     if not key:
         return False
     return True
+
+@app.route("/api/history", methods=["GET"])
+def get_history():
+    if not verify_key(): return jsonify({"error": "Unauthorized"}), 401
+    
+    start_idx = max(0, state.tick_index - 100)
+    history_df = df.iloc[start_idx:state.tick_index]
+    
+    history_list = []
+    for idx, row in history_df.iterrows():
+        tick_data = {"phase": "history", "tick_number": idx}
+        for col in ["open", "high", "low", "close", "volume"]:
+            if col in row:
+                tick_data[col] = float(row[col])
+        history_list.append(tick_data)
+        
+    return jsonify(history_list)
 
 @app.route("/api/price", methods=["GET"])
 def get_price():

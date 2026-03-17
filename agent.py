@@ -18,26 +18,94 @@ API_URL = os.getenv("API_URL", "http://SERVER_IP:8001")
 API_KEY = os.getenv("TEAM_API_KEY", "YOUR_KEY_HERE")
 HEADERS = {"X-API-Key": API_KEY}
 
-# ── Thresholds (tuned for cash decay vs fee tradeoff) ──
-# prob > BUY_PROB  → model says price will go UP   → BUY
-# prob < SELL_PROB → model says price will go DOWN → SELL
+
+# ── BASE Thresholds (neutral starting point — auto-scaled by DynamicRiskScaler) ──
 # prob in between  → uncertain                     → HOLD
-BUY_PROB      = 0.40     # ✨ SUPER AGGRESSIVE ✨ (was 0.50)
-SELL_PROB     = 0.40     # ✨ SUPER AGGRESSIVE ✨ (was 0.40)
-POS_PCT       = 0.50     # Fraction of net worth to deploy
-MAX_POS_PCT   = 0.60     # Server-enforced max position
-STOP_LOSS     = 0.02     # Fixed stop-loss fallback (2%)
-TP_TIER1_PCT  = 0.015    # Take-profit tier 1 (1.5%)
-TP_TIER2_TRAIL= 0.005    # Trailing stop for tier 2 (0.5%)
-BREAKEVEN_PCT = 0.010    # Move SL to breakeven at 1.0% profit
-FEE_PCT       = 0.001    # 0.1% transaction fee
-COOLDOWN_TICKS= 3        # ~30 seconds cooldown after trade
-DRAWDOWN_KILL = 0.03     # Kill switch at 3% drawdown
-RSI_BUY_MAX   = 65       # Don't buy if RSI > 65 (was 60, slightly relaxed)
-RR_MIN        = 1.2      # Minimum risk/reward ratio (was 1.5, relaxed to trigger more buys)
-ATR_SPIKE_MULT= 3.0      # Sit out if candle > 3x ATR
+BASE_BUY_PROB      = 0.245  # Top of real prob range  (0.19-0.26 observed)
+BASE_SELL_PROB     = 0.205  # Bottom of real prob range
+BASE_POS_PCT       = 0.99   # Fully invested
+MIN_POS_PCT        = 0.99   # Fully invested to defeat cash decay
+MAX_POS_PCT        = 0.99   # Fully invested
+STOP_LOSS_ATR_MULT = 3.0    # Stop-loss at Entry - (3 * ATR)
+TP_TIER2_TRAIL_ATR = 3.0    # Trailing stop distance = 3 * ATR (loose to ride trend)
+BREAKEVEN_ATR_MULT = 1.0    # Move SL to breakeven when price > Entry + (1 * ATR)
+FEE_PCT            = 0.001  # 0.1% transaction fee
+COOLDOWN_TICKS     = 3      # ~30 seconds cooldown after trade
+DRAWDOWN_KILL      = 0.08   # Kill switch at 8% drawdown
+BASE_RSI_BUY_MAX   = 65     # Neutral RSI ceiling
+RR_MIN             = 0.0    # DISABLED — R:R filter was blocking all buys in low-ATR markets
+ATR_SPIKE_MULT     = 3.0    # Sit out if candle > 3x ATR
+ML_SELL_LOSS_PCT   = 0.005  # Allow ML sell exit if position is down >0.5%
+
+# ── Dynamic risk zones (P&L % → behaviour) ──
+# > +3%  profit  → AGGRESSIVE   (risk_factor = 1.3)
+# +1% to +3%     → NORMAL+      (risk_factor = 1.1)
+# -1% to +1%     → NEUTRAL      (risk_factor = 1.0)
+# -3% to -1%     → CAUTIOUS     (risk_factor = 0.75)
+# < -3%  loss    → DEFENSIVE    (risk_factor = 0.50)
+RISK_ZONE_PROFIT_HIGH  = 0.03   # > 3% profit   → Aggressive
+RISK_ZONE_PROFIT_LOW   = 0.01   # > 1% profit   → Normal+
+RISK_ZONE_LOSS_LOW     = -0.01  # < -1% loss    → Cautious
+RISK_ZONE_LOSS_HIGH    = -0.03  # < -3% loss    → Defensive
 
 MODEL_PATH    = "models/xgb_model.pkl"
+
+# ═══════════════════════════════════════════════════════════════════════════
+# DYNAMIC RISK SCALER
+# Adjusts all thresholds based on current P&L vs starting net worth.
+# Losing money → be conservative. In profit → be more aggressive.
+# ═══════════════════════════════════════════════════════════════════════════
+class DynamicRiskScaler:
+    def __init__(self, start_worth):
+        self.start_worth = start_worth
+        self.risk_factor  = 1.0   # Current scale (0.5 = defensive, 1.3 = aggressive)
+        self.zone_name    = 'NEUTRAL'
+
+    def update(self, net_worth):
+        """Recompute risk_factor based on current P&L."""
+        pnl_pct = (net_worth - self.start_worth) / (self.start_worth + 1e-8)
+
+        if pnl_pct >= RISK_ZONE_PROFIT_HIGH:
+            self.risk_factor = 1.30
+            self.zone_name   = 'AGGRESSIVE'
+        elif pnl_pct >= RISK_ZONE_PROFIT_LOW:
+            self.risk_factor = 1.10
+            self.zone_name   = 'NORMAL+'
+        elif pnl_pct >= RISK_ZONE_LOSS_LOW:
+            self.risk_factor = 1.00
+            self.zone_name   = 'NEUTRAL'
+        elif pnl_pct >= RISK_ZONE_LOSS_HIGH:
+            self.risk_factor = 0.75
+            self.zone_name   = 'CAUTIOUS'
+        else:
+            self.risk_factor = 0.50
+            self.zone_name   = 'DEFENSIVE'
+
+    def buy_prob(self):
+        """Higher risk_factor → lower buy threshold (easier to buy when profitable)."""
+        # Aggressive → lower threshold; Defensive → higher threshold
+        # Range: BASE/1.3 to BASE/0.5 → ~0.19 to ~0.49
+        return float(np.clip(BASE_BUY_PROB / self.risk_factor, 0.10, 0.60))
+
+    def sell_prob(self):
+        """Higher risk_factor → lower sell threshold (ride profits longer)."""
+        return float(np.clip(BASE_SELL_PROB / self.risk_factor, 0.08, 0.40))
+
+    def pos_pct(self):
+        """Higher risk_factor → larger position size, capped at MAX_POS_PCT."""
+        return float(np.clip(BASE_POS_PCT * self.risk_factor, 0.10, MAX_POS_PCT))
+
+    def rsi_max(self):
+        """Higher risk_factor → allow buying at higher RSI (more momentum tolerance)."""
+        # Aggressive → RSI up to 72; Defensive → RSI max 55
+        return float(np.clip(BASE_RSI_BUY_MAX * self.risk_factor, 45, 75))
+
+    def summary(self, net_worth):
+        pnl_pct = (net_worth - self.start_worth) / (self.start_worth + 1e-8)
+        return (f"[RISK:{self.zone_name} rf={self.risk_factor:.2f}] "
+                f"buy>{self.buy_prob():.2f} sell<{self.sell_prob():.2f} "
+                f"pos={self.pos_pct()*100:.0f}% rsi<{self.rsi_max():.0f} "
+                f"pnl={pnl_pct*100:+.2f}%")
 
 # ═══════════════════════════════════════════════════════════════════════════
 # API HELPERS (exact hackathon format)
@@ -302,10 +370,8 @@ def get_ml_signal(features_row, model, feature_names):
         print(f"  ⚠️ Model error: {e}")
         return 'hold', 0.5
 
-    if prob > BUY_PROB:
-        return 'buy', prob
-    elif prob < SELL_PROB:
-        return 'sell', prob
+    # Action thresholds are intentionally NOT applied here.
+    # The caller (decide) applies dynamic thresholds to the raw prob.
     return 'hold', prob
 
 
@@ -320,27 +386,26 @@ def entry_confluence(action, closes, rsi, atr, price, has_ohlc, candle_range=0):
     if action != 'buy':
         return True, 'sell/hold — no confluence needed'
 
-    # ── RSI Filter: Don't buy overbought ──
-    if rsi > RSI_BUY_MAX:
-        return False, f'RSI too high ({rsi:.1f} > {RSI_BUY_MAX})'
+    # ── RSI Filter: handled dynamically in decide() using dyn_rsi_max ──
+    # (RSI_BUY_MAX removed — no longer a global constant)
 
     # ── Volatility Spike Guard ──
     if has_ohlc and atr > 0 and candle_range > atr * ATR_SPIKE_MULT:
         return False, f'Volatility spike (candle={candle_range:.4f} > {ATR_SPIKE_MULT}x ATR={atr:.4f})'
 
-    # ── Risk/Reward Check ──
-    if atr > 0:
-        stop_dist = 1.5 * atr
-        target_dist = price * TP_TIER1_PCT
-        rr = target_dist / (stop_dist + 1e-8)
-        if rr < RR_MIN:
-            return False, f'R:R too low ({rr:.2f} < {RR_MIN})'
+    # ── Risk/Reward Check (disabled — low ATR environments always fail this) ──
+    # if atr > 0:
+    #     stop_dist = 1.5 * atr
+    #     target_dist = price * TP_TIER1_PCT
+    #     rr = target_dist / (stop_dist + 1e-8)
+    #     if rr < RR_MIN:
+    #         return False, f'R:R too low ({rr:.2f} < {RR_MIN})'
 
-    # ── Trend Alignment ──
+    # ── Trend Alignment: relaxed — allow buy if within 0.3% below EMA ──
     if len(closes) >= 20:
         ema_20 = pd.Series(closes).ewm(span=20, adjust=False).mean().iloc[-1]
-        if price < ema_20:
-            return False, f'Price below 20-EMA ({price:.4f} < {ema_20:.4f})'
+        if price < ema_20 * 0.997:  # Only block if >0.3% below EMA
+            return False, f'Price too far below 20-EMA ({price:.4f} < {ema_20:.4f})'
 
     return True, 'All confluence checks passed'
 
@@ -352,19 +417,18 @@ class PositionManager:
     def __init__(self):
         self.entry_price = None
         self.peak_price = None
-        self.tp1_hit = False          # Has tier1 take-profit been triggered?
         self.sl_price = None          # Current stop-loss level
         self.original_shares = 0     # Shares at entry
 
     def on_entry(self, price, shares, atr):
         self.entry_price = price
         self.peak_price = price
-        self.tp1_hit = False
         self.original_shares = shares
-        # ATR-based stop loss: increased from 1.5x to 5.0x to avoid microscopic 10-second noise
-        self.sl_price = price - (5.0 * atr) if atr > 0 else price * (1 - STOP_LOSS)
+        # ATR-based stop loss: 3.0x ATR for breathing room in volatile markets
+        # Fallback to 2% if ATR is missing/0
+        self.sl_price = price - (STOP_LOSS_ATR_MULT * atr) if atr > 0 else price * 0.98
 
-    def check(self, price, shares):
+    def check(self, price, shares, atr):
         """
         Returns (action, qty, reason) based on position management rules.
         """
@@ -377,23 +441,21 @@ class PositionManager:
 
         pnl_pct = (price - self.entry_price) / self.entry_price
 
-        # ── Break-Even: Move SL to entry + fee once +1.0% ──
-        if pnl_pct >= BREAKEVEN_PCT and not self.tp1_hit:
+        # ── Break-Even: Move SL to entry + fee once + (1 * ATR) ──
+        breakeven_dist = (BREAKEVEN_ATR_MULT * atr) if atr > 0 else (self.entry_price * 0.01)
+        if (price - self.entry_price) >= breakeven_dist:
             new_sl = self.entry_price * (1 + FEE_PCT)
             if new_sl > self.sl_price:
                 self.sl_price = new_sl
 
-        # ── TP Tier 1: Sell 50% at +1.5% ──
-        if pnl_pct >= TP_TIER1_PCT and not self.tp1_hit:
-            self.tp1_hit = True
-            sell_qty = max(1, shares // 2)
-            return 'sell', sell_qty, f'TP1: +{pnl_pct*100:.2f}% — selling 50%'
-
-        # ── TP Tier 2: Trailing stop on remaining ──
-        if self.tp1_hit:
-            trail_sl = self.peak_price * (1 - TP_TIER2_TRAIL)
+        # ── Trailing Stop: Activate once we are in profit ──
+        # We NO LONGER take 50% profit to cash, because cash constantly decays!
+        # Instead, we just aggressively trail the stop loss behind the peak.
+        if (self.peak_price - self.entry_price) >= breakeven_dist:
+            trail_dist = (TP_TIER2_TRAIL_ATR * atr) if atr > 0 else (self.peak_price * 0.005)
+            trail_sl = self.peak_price - trail_dist
             if price <= trail_sl:
-                return 'sell', shares, f'Trailing stop hit @ {price:.4f} (peak={self.peak_price:.4f})'
+                return 'sell', shares, f'Trailing stop hit @ {price:.4f} (peak={self.peak_price:.4f}, trail={trail_dist:.4f})'
 
         # ── Stop-Loss ──
         if price <= self.sl_price:
@@ -405,7 +467,6 @@ class PositionManager:
         if not partial:
             self.entry_price = None
             self.peak_price = None
-            self.tp1_hit = False
             self.sl_price = None
             self.original_shares = 0
 
@@ -457,44 +518,83 @@ class SystemGuard:
 # DECIDE: ORCHESTRATE ALL 5 LAYERS
 # ═══════════════════════════════════════════════════════════════════════════
 def decide(ohlcv_buffer, portfolio, price, model, feature_names, pos_mgr, sys_guard,
-           tick_num, total_ticks, has_ohlc, has_vol):
+           tick_num, total_ticks, has_ohlc, has_vol, risk_scaler=None):
     """
     Master decision function. Runs all 5 layers in sequence.
-    Returns (action, qty, reason).
+    Returns (action, qty, reason, prob).
+    prob=None means the ML model was not reached (early layer blocked).
     """
     shares = portfolio.get('shares', 0)
     cash = portfolio.get('cash', 0)
     net_worth = portfolio.get('net_worth', cash + shares * price)
+
+    # ── Dynamic threshold update ──
+    if risk_scaler is not None:
+        risk_scaler.update(net_worth)
+        dyn_buy_prob  = risk_scaler.buy_prob()
+        dyn_sell_prob = risk_scaler.sell_prob()
+        dyn_pos_pct   = risk_scaler.pos_pct()
+        dyn_rsi_max   = risk_scaler.rsi_max()
+    else:
+        dyn_buy_prob  = BASE_BUY_PROB
+        dyn_sell_prob = BASE_SELL_PROB
+        dyn_pos_pct   = BASE_POS_PCT
+        dyn_rsi_max   = BASE_RSI_BUY_MAX
 
     closes = [t.get('close', t.get('Close', 0)) for t in ohlcv_buffer]
     highs = [t.get('high', t.get('High', 0)) for t in ohlcv_buffer] if has_ohlc else None
     lows = [t.get('low', t.get('Low', 0)) for t in ohlcv_buffer] if has_ohlc else None
     volumes = [t.get('volume', t.get('Volume', 0)) for t in ohlcv_buffer] if has_vol else None
 
-    # ── LAYER 4 FIRST: Check existing position (stop-loss, take-profit) ──
+    # ── LAYER 4: Position Check (TP / SL / Trailing) ──
+    features_row = compute_features(ohlcv_buffer) # Moved up to calculate ATR
+    atr = float(features_row['atr_14'].iloc[0]) if features_row is not None and 'atr_14' in features_row.columns else 0.0
     if shares > 0:
-        pos_action, pos_qty, pos_reason = pos_mgr.check(price, shares)
+        pos_action, pos_qty, pos_reason = pos_mgr.check(price, shares, atr)
         if pos_action == 'sell':
-            return 'sell', pos_qty, f'[L4-POSITION] {pos_reason}'
+            return 'sell', pos_qty, f'[L4-POSITION] {pos_reason}', None
 
     # ── LAYER 5: System stability ──
     sys_ok, sys_reason = sys_guard.check(net_worth, tick_num)
     if not sys_ok:
-        return 'hold', 0, f'[L5-SYSTEM] {sys_reason}'
+        return 'hold', 0, f'[L5-SYSTEM] {sys_reason}', None
 
     # ── LAYER 1: Pre-flight ──
     pf_ok, regime, pf_reason = pre_flight_check(
         closes, highs, lows, volumes, tick_num, total_ticks, has_ohlc, has_vol
     )
     if not pf_ok:
-        return 'hold', 0, f'[L1-PREFLIGHT] {pf_reason}'
+        return 'hold', 0, f'[L1-PREFLIGHT] {pf_reason}', None
 
     # ── LAYER 2: ML Signal ──
-    features_row = compute_features(ohlcv_buffer)
-    action, prob = get_ml_signal(features_row, model, feature_names)
+    # Use get_ml_signal() to get the raw prob — it handles feature alignment,
+    # missing features, and correct column ordering for the model.
+    _, prob = get_ml_signal(features_row, model, feature_names)  # action ignored; we use dynamic thresholds
+
+    # Re-evaluate action using DYNAMIC thresholds (not the hardcoded globals)
+    if prob > dyn_buy_prob:
+        action = 'buy'
+    elif prob < dyn_sell_prob:
+        action = 'sell'
+    else:
+        action = 'hold'
+
+    risk_label = risk_scaler.zone_name if risk_scaler else 'STATIC'
 
     if action == 'hold':
-        return 'hold', 0, f'[L2-ML] Hold (prob={prob:.3f})'
+        # ── Combat Cash Decay: Maintain Base Position ──
+        # If we have less than MIN_POS_PCT, we force a buy to maintain the base holding
+        current_pos_pct = (shares * price) / (net_worth + 1e-8) if net_worth > 0 else 0
+        if current_pos_pct < MIN_POS_PCT:
+            base_target_shares = int((net_worth * MIN_POS_PCT) / price)
+            want_buy = max(0, base_target_shares - shares)
+            affordable = int(cash * 0.99 / (price * (1 + FEE_PCT))) if price > 0 else 0
+            qty = min(want_buy, affordable)
+            
+            if qty > 0:
+                return 'buy', qty, f'[L2-ML:{risk_label}] BASE BUY (qty={qty}, targeting {MIN_POS_PCT*100:.0f}% to combat decay)', prob
+        
+        return 'hold', 0, f'[L2-ML:{risk_label}] Hold (buy>{dyn_buy_prob:.2f} sell<{dyn_sell_prob:.2f})', prob
 
     # ── LAYER 3: Entry Confluence (for BUY only) ──
     if action == 'buy':
@@ -502,34 +602,45 @@ def decide(ohlcv_buffer, portfolio, price, model, feature_names, pos_mgr, sys_gu
         atr = float(features_row['atr_14'].iloc[0]) if features_row is not None and 'atr_14' in features_row.columns else 0.0
         candle_range = float(features_row['candle_range'].iloc[0]) if features_row is not None and 'candle_range' in features_row.columns else 0.0
 
+        # Use dynamic RSI ceiling
+        rsi_blocked = rsi > dyn_rsi_max
+        if rsi_blocked:
+            return 'hold', 0, f'[L3-CONFLUENCE:{risk_label}] RSI too high ({rsi:.1f} > {dyn_rsi_max:.0f})', prob
+
         conf_ok, conf_reason = entry_confluence(action, closes, rsi, atr, price, has_ohlc, candle_range)
         if not conf_ok:
-            return 'hold', 0, f'[L3-CONFLUENCE] {conf_reason}'
+            return 'hold', 0, f'[L3-CONFLUENCE:{risk_label}] {conf_reason}', prob
 
-        # ── Position sizing with 60% cap ──
+        # ── Position sizing with dynamic pos_pct ──
         max_shares = int((net_worth * MAX_POS_PCT) / price)
         can_buy = max(0, max_shares - shares)
-        target_shares = int((net_worth * POS_PCT) / price)
+        target_shares = int((net_worth * dyn_pos_pct) / price)
         want_buy = max(0, target_shares - shares)
         affordable = int(cash * 0.99 / (price * (1 + FEE_PCT))) if price > 0 else 0
         qty = min(want_buy, can_buy, affordable)
 
         if qty <= 0:
-            return 'hold', 0, '[L4-SIZE] Already at max position or no cash'
+            return 'hold', 0, '[L4-SIZE] Already at max position or no cash', prob
 
-        return 'buy', qty, f'[L2-ML] BUY (prob={prob:.3f}, qty={qty}, regime={regime})'
+        return 'buy', qty, (f'[L2-ML:{risk_label}] BUY (qty={qty}, '
+                            f'pos={dyn_pos_pct*100:.0f}%, regime={regime})'), prob
 
     elif action == 'sell':
         if shares <= 0:
-            return 'hold', 0, '[L2-ML] Sell signal but no shares'
+            return 'hold', 0, f'[L2-ML:{risk_label}] Sell signal but no shares', prob
         else:
-            # ✨ AGGRESSIVE MODE ✨
-            # We bought aggressively, so we must HOLD aggressively. 
-            # We ignore the ML model's raw sell signals while in a position,
-            # trusting our 5.0x ATR Stop-Loss and Take-Profit tiers to handle the exit.
-            return 'hold', 0, f'[L2-ML] Ignoring ML Sell (prob={prob:.3f}) to let position run'
+            # Allow ML sell to exit if position is losing >ML_SELL_LOSS_PCT
+            # This prevents zombie losing positions from dragging net worth down
+            if pos_mgr.entry_price is not None:
+                pos_pnl = (price - pos_mgr.entry_price) / pos_mgr.entry_price
+                if pos_pnl < -ML_SELL_LOSS_PCT:
+                    return 'sell', shares, (
+                        f'[L2-ML:{risk_label}] Exit losing position '
+                        f'(pos_pnl={pos_pnl*100:+.2f}%, p={prob:.3f})'), prob
+            # Otherwise hold — let TP/SL tiers manage the exit
+            return 'hold', 0, f'[L2-ML:{risk_label}] Holding — let TP/SL handle exit', prob
 
-    return 'hold', 0, f'[L2-ML] Hold (prob={prob:.3f})'
+    return 'hold', 0, f'[L2-ML:{risk_label}] Hold', prob
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -551,7 +662,16 @@ if __name__ == "__main__":
     # State
     ohlcv_buffer = []
     pos_mgr = PositionManager()
-    sys_guard = SystemGuard()
+    # Initialize with actual portfolio value so kill switch is relative to real starting point
+    try:
+        _init_port = get_portfolio()
+        _start_nw = _init_port.get('net_worth', 100_000)
+    except Exception:
+        _start_nw = 100_000
+    sys_guard = SystemGuard(start_worth=_start_nw)
+    risk_scaler = DynamicRiskScaler(start_worth=_start_nw)
+    print(f"  💰 Starting net worth: ${_start_nw:,.2f} (kill switch at -{DRAWDOWN_KILL*100:.0f}%)")
+    print(f"  📊 Dynamic risk zones: DEFENSIVE<-3% | CAUTIOUS<-1% | NEUTRAL | NORMAL+>1% | AGGRESSIVE>3%")
     tick_num = 0
     has_ohlc = None  # Auto-detect on first tick
     has_vol = None
@@ -599,11 +719,13 @@ if __name__ == "__main__":
                 ohlcv_buffer.pop(0)
 
             # ── Decide ──
-            action, qty, reason = decide(
+            action, qty, reason, prob = decide(
                 ohlcv_buffer, port, price, model, feature_names,
-                pos_mgr, sys_guard, tick_num, total_ticks, 
-                has_ohlc or False, has_vol or False
+                pos_mgr, sys_guard, tick_num, total_ticks,
+                has_ohlc or False, has_vol or False,
+                risk_scaler=risk_scaler
             )
+            prob_str = f'p={prob:.3f}' if prob is not None else 'p=---'
 
             # ── Execute ──
             if action == 'buy' and qty > 0:
@@ -615,20 +737,24 @@ if __name__ == "__main__":
                         atr_val = float(features['atr_14'].iloc[0])
                 pos_mgr.on_entry(price, qty + port.get('shares', 0), atr_val)
                 sys_guard.start_cooldown(tick_num)
-                print(f"  ⚡ BUY {qty} @ {price:.4f} | {reason}")
+                print(f"  ⚡ BUY  {qty:>6} @ {price:.4f} | {prob_str} | {reason}")
 
             elif action == 'sell' and qty > 0:
                 result = sell(qty)
                 partial = qty < port.get('shares', 0)
                 pos_mgr.on_exit(partial=partial)
                 sys_guard.start_cooldown(tick_num)
-                print(f"  🔻 SELL {qty} @ {price:.4f} | {reason}")
+                print(f"  🔻 SELL {qty:>6} @ {price:.4f} | {prob_str} | {reason}")
 
             else:
                 # ── Heartbeat every tick ──
                 sharpe = sys_guard.get_sharpe()
-                print(f"  💓 tick={tick_num} | {price:.4f} | nw=${port.get('net_worth',0):,.0f} | "
-                      f"pnl={port.get('pnl_pct',0):+.2f}% | sharpe={sharpe:.2f} | {reason}")
+                nw = port.get('net_worth', 0)
+                risk_info = risk_scaler.summary(nw) if tick_num % 10 == 0 else f'[RISK:{risk_scaler.zone_name}]'
+                print(f"  💓 tick={tick_num:>4} | {price:.4f} | nw=${nw:,.0f} | "
+                      f"pnl={port.get('pnl_pct',0):+.2f}% | {prob_str} | {reason}")
+                if tick_num % 10 == 0:
+                    print(f"     📊 {risk_info}")
 
             tick_num += 1
             time.sleep(10)
