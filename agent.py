@@ -21,10 +21,17 @@ import numpy as np
 import pandas as pd
 from sklearn.linear_model import SGDClassifier
 from sklearn.preprocessing import StandardScaler
+from dotenv import load_dotenv
+
+load_dotenv() # Load variables from .env file
 
 # ── Config ─────────────────────────────────────────────────────────────
-API_URL  = os.getenv("API_URL",      "https://algotrading.sanyamchhabra.in")
-API_KEY  = os.getenv("TEAM_API_KEY", "ak_ff892bf94ef82a3708cee7ba4df4f181")
+# Match the keys exactly as they appear in the .env file
+API_URL  = os.getenv("API_BASE_URL", os.getenv("API_URL", "https://algotrading.sanyamchhabra.in"))
+# Strip trailing slashes so /api/price doesn't become //api/price
+if API_URL.endswith('/'): API_URL = API_URL[:-1]
+
+API_KEY  = os.getenv("API_KEY", os.getenv("TEAM_API_KEY", "ak_ff892bf94ef82a3708cee7ba4df4f181"))
 HEADERS  = {"X-API-Key": API_KEY}
 
 MODEL_PATH  = "models/xgb_model.pkl"
@@ -275,13 +282,15 @@ class SignalEngine:
 
         if not holding and not chasing:
             buy_sig = False
-            if regime == 'up' and kv > -0.010 and pred_move_5 > -0.010: # Significantly relaxed kv and entry move
+            # Moderate safety brakes: re-applied a middle ground for entry limits
+            # Anti-FOMO: Ensure kv < 0.025 so we don't buy the absolute peak of a massive vertical spike
+            if regime == 'up' and kv > -0.007 and kv < 0.025 and pred_move_5 > -0.007:
                 buy_sig = True; reason = f'trend+kv={kv:+.4f}'
-            elif dev < -0.005*vol5*1000 and pred_move_5 > -0.015: # Significantly relaxed deviation dip requirement
+            elif dev < -0.008*vol5*1000 and pred_move_5 > -0.012:
                 if ml_bull or prob is None or (regime == 'choppy'):
                     buy_sig = True; reason = f'reversion dev={dev:+.4f}'
 
-            if buy_sig and pred_move_5 < MIN_PROFIT * 0.2: # Barely any fee threshold check
+            if buy_sig and pred_move_5 < MIN_PROFIT * 0.35: # Re-enabled moderate fee threshold check
                 buy_sig = False; reason = 'fee_threshold_5t'
             if buy_sig:
                 qty, _ = position_size(cash, price, vol5)
@@ -367,9 +376,12 @@ def run():
                     if new_sl > sl_price:
                         sl_price = new_sl
 
-                # Trailing stop: 3.0 ATR from peak once in profit
+                # Step-Trailing stop: 
+                # If we are up less than 0.3%, keep a wide 3.0 ATR loose trail so we don't get shaken.
+                # If we are up more than 0.3%, tighten the trail to 1.5 ATR to lock in the run!
                 if (peak_price - entry_price) >= breakeven_dist:
-                    trail_sl = peak_price - (3.0 * atr)
+                    trail_multiplier = 1.5 if pnl_pct > 0.003 else 3.0
+                    trail_sl = peak_price - (trail_multiplier * atr)
                     if trail_sl > sl_price:
                         sl_price = trail_sl
 
