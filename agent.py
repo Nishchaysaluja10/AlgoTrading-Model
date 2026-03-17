@@ -254,42 +254,49 @@ class SignalEngine:
         prob       = self.model.predict(closes, volumes, kl, kv, kp)
         p          = np.array(closes, dtype=float)
         vol5       = np.std(np.diff(p[-6:])/p[-6:-1]) if n>=6 else 0.001
+        atr        = np.mean(np.abs(np.diff(p[-15:]))) if n>=15 else (price * 0.001)
         up_count   = sum(1 for i in range(-5,-1) if p[i+1]>p[i]) if n>=6 else 2
-        regime     = 'up' if up_count>=3 else ('down' if up_count<=1 else 'choppy')
-        pred_move  = (kp - price) / price
-        ml_bull    = prob is not None and prob >= 0.51
-        ml_bear    = prob is not None and prob <= 0.48
+        regime     = 'up' if up_count>=2 else ('down' if up_count<=1 else 'choppy')
+        
+        # 5-tick future prediction
+        kp_5       = kl + kv * 5
+        pred_move_5 = (kp_5 - price) / price
+        
+        ml_bull    = prob is not None and prob >= 0.50
+        ml_bear    = prob is not None and prob <= 0.49
         last_exit  = portfolio.get('last_exit_price', 0)
-        chasing    = last_exit > 0 and price >= last_exit * 1.0015
+        chasing    = last_exit > 0 and price >= last_exit * 1.001
 
         action, qty, reason = 'hold', 0, ''
 
         if not holding and not chasing:
             buy_sig = False
-            if regime == 'up' and kv > -0.002 and pred_move > -0.0005:
+            # Less defensive: allow buying if predicted 5-tick move is positive or slightly negative
+            if regime == 'up' and kv > -0.005 and pred_move_5 > -0.005:
                 buy_sig = True; reason = f'trend+kv={kv:+.4f}'
-            elif dev < -0.02*vol5*1000 and pred_move > -0.002:
-                if ml_bull or prob is None or (regime == 'choppy' and (prob is None or prob > 0.48)):
+            elif dev < -0.010*vol5*1000 and pred_move_5 > -0.01:
+                if ml_bull or prob is None or (regime == 'choppy'):
                     buy_sig = True; reason = f'reversion dev={dev:+.4f}'
-            if buy_sig and abs(pred_move) < MIN_PROFIT * 0.1:
-                buy_sig = False; reason = 'fee_threshold'
+            
+            if buy_sig and pred_move_5 < MIN_PROFIT * 0.5:
+                buy_sig = False; reason = 'fee_threshold_5t'
             if buy_sig:
                 qty, _ = position_size(cash, price, vol5)
                 action = 'buy'
 
         elif holding:
-            if regime == 'down' and kv < -0.005:
+            if regime == 'down' and kv < -0.01:
                 action='sell'; qty=portfolio['shares']; reason='downtrend'
-            elif kv < -0.005 and pred_move < -0.0005:
+            elif kv < -0.008 and pred_move_5 < -0.005:
                 action='sell'; qty=portfolio['shares']; reason=f'kv_reversal={kv:+.4f}'
-            elif ml_bear and pred_move < -0.001:
+            elif ml_bear and pred_move_5 < -0.005:
                 action='sell'; qty=portfolio['shares']; reason=f'ml_bear p={prob:.3f}'
-            elif regime=='choppy' and dev > 0.05*vol5*1000:
+            elif regime=='choppy' and dev > 0.1*vol5*1000:
                 action='sell'; qty=portfolio['shares']; reason='reversion_top'
 
         return action, qty, {
-            'kl':kl,'kv':kv,'kp':kp,'dev':dev,'prob':prob,
-            'vol5':vol5,'regime':regime,'reason':reason,
+            'kl':kl,'kv':kv,'kp':kp,'kp_5':kp_5,'dev':dev,'prob':prob,
+            'vol5':vol5,'atr':atr,'regime':regime,'reason':reason,
             'n_online':self.model.n_seen
         }
 
@@ -314,11 +321,8 @@ def run():
     last_exit_price = 0
     last_trade_tick = 0
 
-    STOP_LOSS   = 0.018
-    TAKE_PROFIT = 0.035
-    TRAIL_PCT   = 0.012
-
     print("\n🟢 Bot live. Ctrl+C to stop.\n")
+    sl_price = 0.0
 
     while True:
         try:
@@ -338,22 +342,43 @@ def run():
             engine.update_kalman(price)
             engine.learn(closes, volumes)
 
-            # ── Risk exits ────────────────────────────────────────────
+            # ── Risk exits (ATR-based) ────────────────────────────────
             if port['shares'] > 0 and entry_price is not None:
                 if peak_price is None or price > peak_price:
                     peak_price = price
                 pnl_pct = (price - entry_price) / entry_price
+                
+                atr = np.mean(np.abs(np.diff(closes[-15:]))) if len(closes) >= 15 else (price * 0.001)
+                
+                if sl_price == 0.0:
+                    sl_price = entry_price - (4.0 * atr) # Wider initial stop 4 ATR down
+                
+                # Breakeven condition: if up 2 ATR, move SL to entry + fees + small profit
+                breakeven_dist = 2.0 * atr
+                if (price - entry_price) >= breakeven_dist:
+                    new_sl = entry_price * (1 + EST_FEE_PCT * 4)
+                    if new_sl > sl_price:
+                        sl_price = new_sl
+                        
+                # Trailing stop: Trail heavily by 3.5 ATR from peak once in profit
+                if (peak_price - entry_price) >= breakeven_dist:
+                    trail_sl = peak_price - (3.5 * atr)
+                    if trail_sl > sl_price:
+                        sl_price = trail_sl
+                        
                 hit = None
-                if   pnl_pct < -STOP_LOSS:                  hit = ('🛑','STOP-LOSS')
-                elif pnl_pct >= TAKE_PROFIT:                 hit = ('🎯','TAKE-PROFIT')
-                elif price < peak_price*(1-TRAIL_PCT):       hit = ('📉','TRAIL-STOP')
+                if price <= sl_price:
+                    hit = ('🛑', 'STOP-LOSS / TRAIL')
+                elif pnl_pct >= 0.10: # 10% hard take profit instead of 5%
+                    hit = ('🎯', 'TAKE-PROFIT')
+                    
                 if hit:
                     sell(port['shares']); port = get_portfolio()
                     last_exit_price = price; last_trade_tick = tick_num
                     print(f"  {'─'*70}")
-                    print(f"  {hit[0]} {hit[1]} @ {price:.4f} | pnl={pnl_pct*100:+.2f}% | nw=${port['net_worth']:,.2f}")
+                    print(f"  {hit[0]} {hit[1]} @ {price:.4f} | pnl={pnl_pct*100:+.2f}% | nw=${port.get('net_worth',0):,.2f}")
                     print(f"  {'─'*70}")
-                    entry_price = None; peak_price = None
+                    entry_price = None; peak_price = None; sl_price = 0.0
                     time.sleep(TICK_SLEEP); continue
 
             # ── Gate reset ────────────────────────────────────────────
@@ -369,22 +394,22 @@ def run():
                 print(f"  ⏳ {len(closes)}/7 ticks")
             else:
                 kv_s   = f"{dbg['kv']:+.4f}"
-                pm_s   = f"{((dbg['kp']-price)/price*100):+.4f}%"
+                pm_5_s = f"{((dbg['kp_5']-price)/price*100):+.4f}%"
                 pr_s   = f"{dbg['prob']:.3f}" if dbg['prob'] is not None else " n/a"
                 r_icon = {'up':'📈','down':'📉','choppy':'〰'}.get(dbg['regime'],'?')
                 pos_s  = f"{port['shares']}sh" if port['shares']>0 else "flat"
                 act_s  = f">>> {action.upper()}" if action != 'hold' else '·'
-                print(f"  #{tick_num} {price:.4f} | kv={kv_s} Δ={pm_s} p={pr_s} {r_icon} [{dbg['n_online']}L] | {act_s} {pos_s} | {port['pnl_pct']:+.2f}%")
+                print(f"  #{tick_num} {price:.4f} | kv={kv_s} Δ5={pm_5_s} p={pr_s} {r_icon} [{dbg['n_online']}L] | {act_s} {pos_s} | {port.get('pnl_pct',0):+.2f}%")
 
             # ── Execute ───────────────────────────────────────────────
             if action == 'buy' and qty > 0:
                 resp = buy(qty)
                 if resp:
-                    entry_price = price; peak_price = price
+                    entry_price = price; peak_price = price; sl_price = 0.0
                     last_trade_tick = tick_num
                     port = get_portfolio()
                     print(f"  {'─'*70}")
-                    print(f"  📈 BUY  {qty} @ {price:.4f} | {dbg['reason']} | nw=${port['net_worth']:,.2f}")
+                    print(f"  📈 BUY  {qty} @ {price:.4f} | {dbg['reason']} | nw=${port.get('net_worth',0):,.2f}")
                     print(f"  {'─'*70}")
 
             elif action == 'sell' and port['shares'] > 0:
@@ -395,9 +420,9 @@ def run():
                     port = get_portfolio()
                     icon = "✅" if tpnl >= 0 else "🔴"
                     print(f"  {'─'*70}")
-                    print(f"  {icon} SELL {qty} @ {price:.4f} | trade={tpnl:+.2f}% | {dbg['reason']} | nw=${port['net_worth']:,.2f}")
+                    print(f"  {icon} SELL {qty} @ {price:.4f} | trade={tpnl:+.2f}% | {dbg['reason']} | nw=${port.get('net_worth',0):,.2f}")
                     print(f"  {'─'*70}")
-                    entry_price = None; peak_price = None
+                    entry_price = None; peak_price = None; sl_price = 0.0
 
             time.sleep(TICK_SLEEP)
 
